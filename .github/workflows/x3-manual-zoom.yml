@@ -1,0 +1,41 @@
+
+name: Build X3 Manual Manga Zoom
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out custom branch
+        uses: actions/checkout@v4
+
+      - name: Save custom patch
+        run: cp manual_zoom.patch /tmp/manual_zoom.patch
+
+      - name: Check out Matcha 2.0.0
+        run: |
+          git fetch https://github.com/eszter007/matcha-reader.git \
+            refs/tags/2.0.0:refs/tags/2.0.0
+          git checkout --detach refs/tags/2.0.0
+          git submodule update --init --recursive
+
+      - name: Apply custom zoom patch
+        run: git apply --check /tmp/manual_zoom.patch && git apply /tmp/manual_zoom.patch
+
+      - name: Install PlatformIO
+        run: python -m pip install platformio
+
+      - name: Build X3 firmware
+        run: pio run -e default
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: x3-manual-zoom-firmware
+          path: .pio/build/default/firmware.bin
+          if-no-files-found: error
