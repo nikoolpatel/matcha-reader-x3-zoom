@@ -1,0 +1,181 @@
+--- a/src/activities/reader/MangaReaderActivity.h
++++ b/src/activities/reader/MangaReaderActivity.h
+@@ -79,6 +79,16 @@
+ 
+   enum class ViewMode { FullPage, PanelZoom };
+   ViewMode viewMode = ViewMode::FullPage;
++
++  // X3 manual manga viewport. Only active while a source page image exists; if a
++  // book contains panels but no original pages, Matcha's panel reader is used.
++  static constexpr unsigned long MANUAL_ZOOM_HOLD_MS = 600;
++  static constexpr int MANUAL_ZOOM_STEP_COUNT = 5;
++  int manualZoomStep_ = 0;  // 0..4 -> 100, 150, 200, 250, 300 percent
++  int manualPanX_ = 0;     // screen pixels, relative to centred enlarged image
++  int manualPanY_ = 0;
++  bool handleManualZoomInput();
++  void renderManualZoom();
+ 
+   // Reading-session plugin events, reported the way the other readers report them.
+   ReaderSessionReporter sessionReporter_;
+--- a/src/activities/reader/MangaReaderActivity.cpp
++++ b/src/activities/reader/MangaReaderActivity.cpp
+@@ -664,6 +664,11 @@
+ 
+   if (wordSelect_ && handleWordSelectInput()) return;
+ 
++  // X3 manual manga view: short presses pan/zoom, holds retain menu/back/page
++  // actions. This must run BEFORE Matcha's normal Back/Confirm/page-turn handlers.
++  // The normal manga-panel reader remains the fallback for panel-only volumes.
++  if (currentPageHasImage && !isAtEndOfBook() && handleManualZoomInput()) return;
++
+   if (showBookmarkMessage && (millis() - bookmarkMessageTime) >= ReaderUtils::BOOKMARK_MESSAGE_DURATION_MS) {
+     showBookmarkMessage = false;
+     requestUpdate();
+@@ -850,13 +855,18 @@
+ 
+   if (renderEndOfBook()) return;
+ 
+-  switch (viewMode) {
+-    case ViewMode::FullPage:
+-      renderFullPage();
+-      break;
+-    case ViewMode::PanelZoom:
+-      renderPanelZoom();
+-      break;
++  // Custom X3 firmware: prioritize the original page over guessed panel crops.
++  if (currentPageHasImage) {
++    renderManualZoom();
++  } else {
++    switch (viewMode) {
++      case ViewMode::FullPage:
++        renderFullPage();
++        break;
++      case ViewMode::PanelZoom:
++        renderPanelZoom();
++        break;
++    }
+   }
+ 
+   saveProgress();
+@@ -967,6 +977,121 @@
+           (int)g.rotated);
+   out = adoptFullPageGeom(g);
+   return true;
++}
++
++bool MangaReaderActivity::handleManualZoomInput() {
++  using B = MappedInputManager::Button;
++  constexpr unsigned long hold = MANUAL_ZOOM_HOLD_MS;
++
++  // Using wasLongPressed consumes the later release; one hold = one action.
++  // Check holds first so releasing a long hold never also pans/zooms.
++  if (mappedInput.wasLongPressed(B::Left, hold) || mappedInput.wasLongPressed(B::Down, hold)) {
++    prevPage(false);
++    return true;
++  }
++  if (mappedInput.wasLongPressed(B::Right, hold) || mappedInput.wasLongPressed(B::Up, hold)) {
++    nextPage(false);
++    return true;
++  }
++  if (mappedInput.wasLongPressed(B::Confirm, hold)) {
++    launchMenu();
++    return true;
++  }
++  if (mappedInput.wasLongPressed(B::Back, hold)) {
++    onGoHome();
++    return true;
++  }
++
++  // Short action on RELEASE, so it cannot fire before the long-press deadline.
++  if (mappedInput.wasReleased(B::Left)) {
++    manualPanX_ += renderer.getScreenWidth() / 5;
++  } else if (mappedInput.wasReleased(B::Right)) {
++    manualPanX_ -= renderer.getScreenWidth() / 5;
++  } else if (mappedInput.wasReleased(B::Confirm)) {
++    manualPanY_ += renderer.getScreenHeight() / 5;
++  } else if (mappedInput.wasReleased(B::Back)) {
++    manualPanY_ -= renderer.getScreenHeight() / 5;
++  } else if (mappedInput.wasReleased(B::Up)) {
++    if (manualZoomStep_ < MANUAL_ZOOM_STEP_COUNT - 1) ++manualZoomStep_;
++  } else if (mappedInput.wasReleased(B::Down)) {
++    if (manualZoomStep_ > 0) --manualZoomStep_;
++  } else {
++    return false;
++  }
++
++  if (manualZoomStep_ == 0) {
++    manualPanX_ = 0;
++    manualPanY_ = 0;
++  }
++  requestUpdate();
++  return true;
++}
++
++void MangaReaderActivity::renderManualZoom() {
++  renderer.clearScreen();
++  displayedRotated_ = false;
++  displayedMap_.valid = false;
++
++  const std::string imgPath = book->getPageImagePath(currentPage);
++  ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(imgPath);
++  ImageDimensions dims{static_cast<int16_t>(currentPageBmpWidth), static_cast<int16_t>(currentPageBmpHeight)};
++  if (!decoder || ((dims.width <= 0 || dims.height <= 0) && !decoder->getDimensions(imgPath, dims)) ||
++      dims.width <= 0 || dims.height <= 0) {
++    renderer.drawCenteredText(UI_12_FONT_ID, renderer.getScreenHeight() / 2, tr(STR_PAGE_LOAD_ERROR), true);
++    renderer.displayBuffer();
++    return;
++  }
++
++  const auto g = applyFullPageGeometry(dims.width, dims.height);
++  const auto savedOrientation = static_cast<GfxRenderer::Orientation>(g.savedOrientation);
++  displayedRotated_ = g.rotated;
++  const int zoomPct = 100 + manualZoomStep_ * 50;
++  const int scaledW = std::max(1, g.destWidth * zoomPct / 100);
++  const int scaledH = std::max(1, g.destHeight * zoomPct / 100);
++  const int maxPanX = std::max(0, (scaledW - g.screenW + 1) / 2);
++  const int maxPanY = std::max(0, (scaledH - g.screenH + 1) / 2);
++  manualPanX_ = std::clamp(manualPanX_, -maxPanX, maxPanX);
++  manualPanY_ = std::clamp(manualPanY_, -maxPanY, maxPanY);
++  int x = (g.screenW - scaledW) / 2 + manualPanX_;
++  int y = (g.screenH - scaledH) / 2 + manualPanY_;
++  // When the zoomed page is wider/taller than the screen, never show blank
++  // margins along that axis. Narrower dimensions remain centred.
++  if (scaledW >= g.screenW) x = std::clamp(x, g.screenW - scaledW, 0);
++  if (scaledH >= g.screenH) y = std::clamp(y, g.screenH - scaledH, 0);
++
++  RenderConfig config{};
++  config.x = x;
++  config.y = y;
++  config.maxWidth = scaledW;
++  config.maxHeight = scaledH;
++  config.useExactDimensions = true;
++  config.allowUpscale = true;
++  config.useGrayscale = true;
++  config.useDithering = true;
++  config.whitenPaper = true;
++  // Deliberately don't use pixel caching: viewport position changes the
++  // destination origin, and using Matcha's full-page cache would be incorrect.
++
++  renderer.setRenderMode(GfxRenderer::BW);
++  decoder->decodeToFramebuffer(imgPath, renderer, config);
++  if (currentPageBwOnly) {
++    ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
++  } else {
++    renderer.storeBwBuffer();
++    ReaderUtils::displayGrayBaseWithRefreshCycle(renderer, pagesUntilFullRefresh);
++    renderer.clearScreen(0x00);
++    renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
++    decoder->decodeToFramebuffer(imgPath, renderer, config);
++    renderer.copyGrayscaleLsbBuffers();
++    renderer.clearScreen(0x00);
++    renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
++    decoder->decodeToFramebuffer(imgPath, renderer, config);
++    renderer.copyGrayscaleMsbBuffers();
++    renderer.displayGrayBuffer();
++    renderer.setRenderMode(GfxRenderer::BW);
++    renderer.restoreBwBuffer();
++  }
++  if (g.rotated) renderer.setOrientation(savedOrientation);
+ }
+ 
+ void MangaReaderActivity::renderFullPage() {
