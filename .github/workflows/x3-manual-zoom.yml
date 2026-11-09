@@ -32,8 +32,16 @@ jobs:
         with:
           python-version: '3.12'
 
+
       - name: Install compatible PIOArduino
         run: python -m pip install "pioarduino==6.1.19"
+
+      - name: Fix nested PIOArduino environment
+        run: |
+          python -m pip install uv
+          pio pkg install -e default
+          uv pip install --python "$HOME/.platformio/penv/bin/python" "pioarduino==6.1.19"
+          "$HOME/.platformio/penv/bin/pio" --version
 
       - name: Build X3 firmware
         run: pio run -e default
