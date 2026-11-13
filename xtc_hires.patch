@@ -203,7 +203,7 @@
 +  std::vector<uint8_t> firstPlane, secondPlane;
 +  // 12 destination columns per strip bounds RAM to ~10 KB at 2x resolution.
 +  for (int dx0 = 0; dx0 < v.dstWidth; dx0 += 12) {
-+    const int dx1 = std::min(dx0 + 12, v.dstWidth);
++    const int dx1 = std::min<int32_t>(dx0 + 12, v.dstWidth);
 +    int sourceLo = v.pageWidth, sourceHi = -1;
 +    for (int x = dx0; x < dx1; ++x) {
 +      const int sx = v.srcX(x);
