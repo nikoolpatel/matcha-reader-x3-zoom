@@ -1,0 +1,76 @@
+--- a/src/activities/reader/XtcReaderActivity.cpp
++++ b/src/activities/reader/XtcReaderActivity.cpp
+@@ -561,8 +561,8 @@
+         case 1: changePageBy(+1); break; // Right held: next
+         case 2: launchMenu(); break;     // Confirm held: menu
+         case 3: onGoHome(); break;       // Back held: leave reader
+-        case 4: changePageBy(+1); break; // Side up held: next
+-        case 5: changePageBy(-1); break; // Side down held: previous
++        case 4: changePageBy(-1); break; // Side up held: previous
++        case 5: changePageBy(+1); break; // Side down held: next
+       }
+       return true;
+     }
+@@ -601,9 +601,11 @@
+     if (pass != 0) return true;
+     const size_t rowBytes = (v.pageWidth + 7) / 8;
+     std::vector<uint8_t> rows;
+-    // Each group contains at most 12 destination rows (at 2x source, ~24 source rows).
+-    for (int dy0 = 0; dy0 < v.dstHeight; dy0 += 12) {
+-      const int dy1 = std::min<int>(dy0 + 12, v.dstHeight);
++    // Fewer SD seek/read cycles than 12-row strips, while staying bounded in RAM.
++    // At 2x (1056 wide), 32 destination rows need about 8 KB of source data.
++    constexpr int ROW_STRIP = 32;
++    for (int dy0 = 0; dy0 < v.dstHeight; dy0 += ROW_STRIP) {
++      const int dy1 = std::min<int>(dy0 + ROW_STRIP, v.dstHeight);
+       int first = v.pageHeight, last = -1;
+       for (int y = dy0; y < dy1; ++y) {
+         const int sy = v.srcY(y);
+@@ -639,9 +641,12 @@
+   const size_t colBytes = (static_cast<size_t>(v.pageHeight) + 7) / 8;
+   const size_t planeSize = static_cast<size_t>(v.pageWidth) * colBytes;
+   std::vector<uint8_t> firstPlane, secondPlane;
+-  // 12 destination columns per strip bounds RAM to ~10 KB at 2x resolution.
+-  for (int dx0 = 0; dx0 < v.dstWidth; dx0 += 12) {
+-    const int dx1 = std::min<int32_t>(dx0 + 12, v.dstWidth);
++  // Doubling strips cuts SD-card read calls roughly in half. At 2x resolution,
++  // two bitplanes for 24 destination columns use about 19 KB total; still
++  // substantially smaller than a full high-resolution source plane.
++  constexpr int COLUMN_STRIP = 24;
++  for (int dx0 = 0; dx0 < v.dstWidth; dx0 += COLUMN_STRIP) {
++    const int dx1 = std::min<int32_t>(dx0 + COLUMN_STRIP, v.dstWidth);
+     int sourceLo = v.pageWidth, sourceHi = -1;
+     for (int x = dx0; x < dx1; ++x) {
+       const int sx = v.srcX(x);
+@@ -694,7 +699,12 @@
+   const ZoomViewport v = zoomViewport();
+   renderer.clearScreen();
+   if (!renderZoomPass(v, 0, true)) return false;
+-  if (xtc->getBitDepth() == 2) {
++  // Fast navigation: when zoomed into a four-gray XTCH page, redraw the
++  // combined black/gray ink as monochrome. A full grayscale waveform needs
++  // several buffer passes and is visibly slower on the X3. Full-page (100%)
++  // viewing continues to use all four grays; 1-bit XTC is unchanged.
++  const bool fullGrayscale = (xtc->getBitDepth() == 2 && zoomLevelIndex == 0);
++  if (fullGrayscale) {
+     ReaderUtils::displayGrayBaseWithRefreshCycle(renderer, pagesUntilFullRefresh);
+     renderer.clearScreen(0x00);
+     if (!renderZoomPass(v, 1, false)) return false;
+@@ -708,10 +718,13 @@
+     if (!renderZoomPass(v, 0, true)) return false;
+     renderer.cleanupGrayscaleWithFrameBuffer();
+   } else {
+-    // XTC on 2x input: overlay status bar only if selected in settings.
+-    if (SETTINGS.statusBarSpec().xtcMode == CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_TOP)
+-      renderStatusBarOverlay(StatusBarOverlayPosition::Top);
+-    else renderStatusBarOverlay(StatusBarOverlayPosition::Bottom);
++    // Only add the usual XTC status bar on 1-bit pages. For grayscale XTCH,
++    // the zoomed fast-navigation viewport keeps the artwork unobstructed.
++    if (xtc->getBitDepth() == 1) {
++      if (SETTINGS.statusBarSpec().xtcMode == CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_TOP)
++        renderStatusBarOverlay(StatusBarOverlayPosition::Top);
++      else renderStatusBarOverlay(StatusBarOverlayPosition::Bottom);
++    }
+     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+   }
+   return true;
