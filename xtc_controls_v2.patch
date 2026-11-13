@@ -1,0 +1,95 @@
+diff --git a/src/activities/reader/XtcReaderActivity.cpp b/src/activities/reader/XtcReaderActivity.cpp
+index b427338..5970366 100644
+--- a/src/activities/reader/XtcReaderActivity.cpp
++++ b/src/activities/reader/XtcReaderActivity.cpp
+@@ -75,7 +75,10 @@ void XtcReaderActivity::jumpToPercent(const int percent) {
+   const uint32_t total = xtc->getPageCount();
+   uint32_t target = static_cast<uint32_t>(static_cast<float>(percent) / 100.0f * total);
+   if (target >= total && total > 0) target = total - 1;
+-  currentPage = target;
++  if (currentPage != target) {
++    currentPage = target;
++    resetZoomPosition();
++  }
+ }
+ 
+ void XtcReaderActivity::readerLoop() {
+@@ -163,6 +166,7 @@ void XtcReaderActivity::readerLoop() {
+     }
+   }
+   const bool changed = currentPage != before;
++  if (changed) resetZoomPosition();
+   // A skip is navigation, not reading: it never counts toward session dwell.
+   notePageTurn(!skipPages && !prevTriggered, changed);
+   if (changed && (touch.prev || touch.next)) haptic_feedback::touchAction(skipPages);
+@@ -171,7 +175,10 @@ void XtcReaderActivity::readerLoop() {
+ 
+ bool XtcReaderActivity::isAtEndOfBook() const { return xtc && currentPage >= xtc->getPageCount(); }
+ 
+-void XtcReaderActivity::onReturnFromEndOfBook() { currentPage = xtc->getPageCount() > 0 ? xtc->getPageCount() - 1 : 0; }
++void XtcReaderActivity::onReturnFromEndOfBook() {
++  currentPage = xtc->getPageCount() > 0 ? xtc->getPageCount() - 1 : 0;
++  resetZoomPosition();
++}
+ 
+ void XtcReaderActivity::render(RenderLock&&) {
+   if (!xtc) {
+@@ -236,7 +243,13 @@ void XtcReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction a
+         startActivityForResult(
+             std::make_unique<XtcReaderChapterSelectionActivity>(renderer, mappedInput, xtc, currentPage),
+             [this](const ActivityResult& result) {
+-              if (!result.isCancelled) currentPage = std::get<PageResult>(result.data).page;
++              if (!result.isCancelled) {
++                const uint32_t target = std::get<PageResult>(result.data).page;
++                if (currentPage != target) {
++                  currentPage = target;
++                  resetZoomPosition();
++                }
++              }
+               requestUpdate();
+             });
+       }
+@@ -266,7 +279,10 @@ void XtcReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction a
+                              [this](const ActivityResult& result) {
+                                if (!result.isCancelled && xtc) {
+                                  const uint32_t target = std::get<PageResult>(result.data).page;
+-                                 if (target < xtc->getPageCount()) currentPage = target;
++                                 if (target < xtc->getPageCount() && currentPage != target) {
++                                   currentPage = target;
++                                   resetZoomPosition();
++                                 }
+                                }
+                                requestUpdate();
+                              });
+@@ -479,6 +495,7 @@ XtcReaderActivity::ZoomViewport XtcReaderActivity::zoomViewport() const {
+ }
+ 
+ void XtcReaderActivity::resetZoomPosition() {
++  zoomLevelIndex = 0; // Always fit the whole page after a page turn.
+   if (!xtc) return;
+   zoomCenterX = xtc->getPageWidth() / 2;
+   zoomCenterY = xtc->getPageHeight() / 2;
+@@ -562,11 +579,11 @@ bool XtcReaderActivity::handleZoomButtons() {
+           case 1: panBy(+1, 0); break;
+           case 2:
+             if (ignoreNextConfirmRelease) ignoreNextConfirmRelease = false;
+-            else panBy(0, -1);
++            else panBy(0, +1); // Select short: pan down
+             break;
+-          case 3: panBy(0, +1); break;
+-          case 4: zoomBy(+1); break;
+-          case 5: zoomBy(-1); break;
++          case 3: panBy(0, -1); break; // Back short: pan up
++          case 4: zoomBy(-1); break; // Side Up short: zoom out
++          case 5: zoomBy(+1); break; // Side Down short: zoom in
+         }
+       }
+       return true;
+@@ -942,6 +959,7 @@ bool XtcReaderActivity::writeSyncedPosition() {
+   // The page in memory too: leaving the reader saves it over the record otherwise.
+   RenderLock lock(*this);
+   loadProgress();
++  resetZoomPosition();
+   return true;
+ }
+ 
