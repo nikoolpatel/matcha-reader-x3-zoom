@@ -1,0 +1,343 @@
+--- a/src/activities/reader/XtcReaderActivity.cpp
++++ b/src/activities/reader/XtcReaderActivity.cpp
+@@ -16,6 +16,7 @@
+ #include <Memory.h>
+ 
+ #include <algorithm>
++#include <cstring>
+ 
+ #include "CrossPointSettings.h"
+ #include "CrossPointState.h"
+@@ -61,6 +62,7 @@
+   // Load saved progress
+   loadProgress();
+   loadCachedBookmarks();
++  resetZoomPosition();
+ }
+ 
+ void XtcReaderActivity::onReaderExit() {
+@@ -99,6 +101,18 @@
+     handleEndOfBookMenu();
+     return;
+   }
++
++  // Manual zoom owns the six physical X3 reading buttons. It handles short and long
++  // releases explicitly; the original XTC page-turn logic below is for touch/other boards.
++  if (handleZoomButtons()) return;
++  // Do not let legacy Confirm/Back hold handlers fire before our 600 ms threshold.
++  // Otherwise a 500 ms hold could exit the book rather than pan vertically.
++  if (mappedInput.isPressed(MappedInputManager::Button::Confirm) ||
++      mappedInput.isPressed(MappedInputManager::Button::Back) ||
++      mappedInput.isPressed(MappedInputManager::Button::Left) ||
++      mappedInput.isPressed(MappedInputManager::Button::Right) ||
++      mappedInput.isPressed(MappedInputManager::Button::Up) ||
++      mappedInput.isPressed(MappedInputManager::Button::Down)) return;
+ 
+   // Open the reader menu on Confirm (swallow the release that opened the book from the library),
+   // or on the touch menu gesture.
+@@ -446,10 +460,264 @@
+   return true;
+ }
+ 
++// High-resolution XTC/XTCH renderer for the X3.  On a 2x page at 100%,
++// viewport maps the whole source to the 528x792 panel; at 200%, pixels
++// are sampled 1:1 from the image.  Never allocate the full 2x page bitmap.
++XtcReaderActivity::ZoomViewport XtcReaderActivity::zoomViewport() const {
++  const int32_t srcW = xtc->getPageWidth(), srcH = xtc->getPageHeight();
++  const int32_t dstW = renderer.getScreenWidth(), dstH = renderer.getScreenHeight();
++  // The fit rect must account for letterboxing, never distort the source aspect.
++  const int32_t fitW = std::max<int32_t>(srcW, (static_cast<int64_t>(srcH) * dstW + dstH - 1) / dstH);
++  const int32_t fitH = std::max<int32_t>(srcH, (static_cast<int64_t>(srcW) * dstH + dstW - 1) / dstW);
++  const uint16_t z = ZOOM_LEVELS[zoomLevelIndex];
++  const int32_t visibleW = std::max<int32_t>(1, (static_cast<int64_t>(fitW) * 100 + z - 1) / z);
++  const int32_t visibleH = std::max<int32_t>(1, (static_cast<int64_t>(fitH) * 100 + z - 1) / z);
++  const int32_t cx = zoomCenterX < 0 ? srcW / 2 : zoomCenterX;
++  const int32_t cy = zoomCenterY < 0 ? srcH / 2 : zoomCenterY;
++  return ZoomViewport{cx - visibleW / 2, cy - visibleH / 2, visibleW, visibleH,
++                      dstW, dstH, srcW, srcH};
++}
++
++void XtcReaderActivity::resetZoomPosition() {
++  if (!xtc) return;
++  zoomCenterX = xtc->getPageWidth() / 2;
++  zoomCenterY = xtc->getPageHeight() / 2;
++}
++
++void XtcReaderActivity::clampZoomPosition() {
++  if (!xtc) return;
++  const ZoomViewport v = zoomViewport();
++  if (v.width >= v.pageWidth) zoomCenterX = v.pageWidth / 2;
++  else zoomCenterX = std::max(v.width / 2, std::min(v.pageWidth - (v.width + 1) / 2, zoomCenterX));
++  if (v.height >= v.pageHeight) zoomCenterY = v.pageHeight / 2;
++  else zoomCenterY = std::max(v.height / 2, std::min(v.pageHeight - (v.height + 1) / 2, zoomCenterY));
++}
++
++void XtcReaderActivity::zoomBy(int amount) {
++  const int idx = std::max(0, std::min(4, static_cast<int>(zoomLevelIndex) + amount));
++  if (idx == zoomLevelIndex) return;
++  zoomLevelIndex = static_cast<uint8_t>(idx);
++  clampZoomPosition();
++  requestUpdate();
++}
++
++void XtcReaderActivity::panBy(int horizontal, int vertical) {
++  if (zoomLevelIndex == 0) return; // 100% fitted page: no panning
++  const ZoomViewport v = zoomViewport();
++  zoomCenterX += horizontal * std::max<int32_t>(1, v.width / 5);
++  zoomCenterY += vertical * std::max<int32_t>(1, v.height / 5);
++  clampZoomPosition();
++  requestUpdate();
++}
++
++void XtcReaderActivity::changePageBy(int direction) {
++  if (!xtc || !xtc->getPageCount()) return;
++  const uint32_t before = currentPage;
++  if (direction < 0) {
++    if (currentPage > 0) --currentPage;
++  } else if (direction > 0 && currentPage < xtc->getPageCount()) {
++    ++currentPage; // existing end-of-book sentinel stays intact
++  }
++  if (currentPage != before) {
++    resetZoomPosition();
++    notePageTurn(direction > 0, true);
++    requestUpdate();
++  }
++}
++
++bool XtcReaderActivity::handleZoomButtons() {
++  // On X3, Left/Right are the front navigation pair, Confirm/Back are the other
++  // front pair, Up/Down are the side buttons. Use default side-button assignments
++  // in Settings; user-mapped side actions suppress Up/Down at the input mapper.
++  using B = MappedInputManager::Button;
++  static constexpr B buttons[6] = {B::Left, B::Right, B::Confirm, B::Back, B::Up, B::Down};
++  // A menu can consume a held key's release before we resume; don't let that
++  // suppress the next independent short press.
++  for (int i = 0; i < 6; ++i)
++    if (!mappedInput.isPressed(buttons[i]) && !mappedInput.wasReleased(buttons[i]))
++      suppressZoomRelease[i] = false;
++  for (int i = 0; i < 6; ++i) {
++    if (mappedInput.wasLongPressed(buttons[i], ZOOM_HOLD_MS)) {
++      suppressZoomRelease[i] = true;
++      switch (i) {
++        case 0: changePageBy(-1); break; // Left held: previous
++        case 1: changePageBy(+1); break; // Right held: next
++        case 2: launchMenu(); break;     // Confirm held: menu
++        case 3: onGoHome(); break;       // Back held: leave reader
++        case 4: changePageBy(+1); break; // Side up held: next
++        case 5: changePageBy(-1); break; // Side down held: previous
++      }
++      return true;
++    }
++  }
++  for (int i = 0; i < 6; ++i) {
++    if (mappedInput.wasReleased(buttons[i])) {
++      // X3 front-button transitions can briefly echo onto a side input.
++      if (i >= 4 && !mappedInput.sideReleaseAlone()) return true;
++      const bool wasLong = suppressZoomRelease[i];
++      suppressZoomRelease[i] = false;
++      if (!wasLong) {
++        switch (i) {
++          case 0: panBy(-1, 0); break;
++          case 1: panBy(+1, 0); break;
++          case 2:
++            if (ignoreNextConfirmRelease) ignoreNextConfirmRelease = false;
++            else panBy(0, -1);
++            break;
++          case 3: panBy(0, +1); break;
++          case 4: zoomBy(+1); break;
++          case 5: zoomBy(-1); break;
++        }
++      }
++      return true;
++    }
++  }
++  return false;
++}
++
++// pass 0: any ink (black base); 1: dark gray; 2: any gray.
++// For 1-bit XTC we only need pass 0. For 2-bit XTCH we process source columns
++// in bounded strips, never buffering an entire source plane.
++bool XtcReaderActivity::renderZoomPass(const ZoomViewport& v, uint8_t pass, bool state) {
++  const uint8_t depth = xtc->getBitDepth();
++  if (depth == 1) {
++    if (pass != 0) return true;
++    const size_t rowBytes = (v.pageWidth + 7) / 8;
++    std::vector<uint8_t> rows;
++    // Each group contains at most 12 destination rows (at 2x source, ~24 source rows).
++    for (int dy0 = 0; dy0 < v.dstHeight; dy0 += 12) {
++      const int dy1 = std::min<int>(dy0 + 12, v.dstHeight);
++      int first = v.pageHeight, last = -1;
++      for (int y = dy0; y < dy1; ++y) {
++        const int sy = v.srcY(y);
++        if (sy >= 0 && sy < v.pageHeight) { first = std::min(first, sy); last = std::max(last, sy); }
++      }
++      if (last < first) continue;
++      const size_t start = static_cast<size_t>(first) * rowBytes;
++      const size_t bytes = static_cast<size_t>(last - first + 1) * rowBytes;
++      rows.resize(bytes);
++      size_t copied = 0;
++      const auto err = xtc->loadPageStreaming(currentPage,
++          [&](const uint8_t* data, size_t count, size_t offset) {
++            if (offset >= start && offset - start <= bytes && count <= bytes - (offset - start)) {
++              memcpy(rows.data() + (offset - start), data, count);
++              copied += count;
++            }
++          }, 2048, nullptr, nullptr, start, bytes);
++      if (err != xtc::XtcError::OK || copied != bytes) return false;
++      for (int y = dy0; y < dy1; ++y) {
++        const int sy = v.srcY(y);
++        if (sy < first || sy > last) continue;
++        const uint8_t* row = rows.data() + static_cast<size_t>(sy - first) * rowBytes;
++        for (int x = 0; x < v.dstWidth; ++x) {
++          const int sx = v.srcX(x);
++          if (sx < 0 || sx >= v.pageWidth) continue;
++          if ((row[sx >> 3] & (0x80 >> (sx & 7))) == 0) renderer.drawPixel(x, y, state);
++        }
++      }
++    }
++    return true;
++  }
++
++  const size_t colBytes = (static_cast<size_t>(v.pageHeight) + 7) / 8;
++  const size_t planeSize = static_cast<size_t>(v.pageWidth) * colBytes;
++  std::vector<uint8_t> firstPlane, secondPlane;
++  // 12 destination columns per strip bounds RAM to ~10 KB at 2x resolution.
++  for (int dx0 = 0; dx0 < v.dstWidth; dx0 += 12) {
++    const int dx1 = std::min(dx0 + 12, v.dstWidth);
++    int sourceLo = v.pageWidth, sourceHi = -1;
++    for (int x = dx0; x < dx1; ++x) {
++      const int sx = v.srcX(x);
++      if (sx >= 0 && sx < v.pageWidth) { sourceLo = std::min(sourceLo, sx); sourceHi = std::max(sourceHi, sx); }
++    }
++    if (sourceHi < sourceLo) continue;
++    // Files are physically ordered right-to-left, one byte-column per x.
++    const size_t diskCol = static_cast<size_t>(v.pageWidth - 1 - sourceHi);
++    const size_t nCols = static_cast<size_t>(sourceHi - sourceLo + 1);
++    const size_t start = diskCol * colBytes;
++    const size_t length = nCols * colBytes;
++    firstPlane.resize(length);
++    secondPlane.resize(length);
++    size_t copied0 = 0, copied1 = 0;
++    const auto e0 = xtc->loadPageStreaming(currentPage,
++        [&](const uint8_t* data, size_t count, size_t offset) {
++          if (offset >= start && offset - start <= length && count <= length - (offset - start)) {
++            memcpy(firstPlane.data() + offset - start, data, count); copied0 += count;
++          }
++        }, 2048, nullptr, nullptr, start, length);
++    if (e0 != xtc::XtcError::OK || copied0 != length) return false;
++    const size_t secondStart = planeSize + start;
++    const auto e1 = xtc->loadPageStreaming(currentPage,
++        [&](const uint8_t* data, size_t count, size_t offset) {
++          if (offset >= secondStart && offset - secondStart <= length && count <= length - (offset - secondStart)) {
++            memcpy(secondPlane.data() + offset - secondStart, data, count); copied1 += count;
++          }
++        }, 2048, nullptr, nullptr, secondStart, length);
++    if (e1 != xtc::XtcError::OK || copied1 != length) return false;
++    for (int x = dx0; x < dx1; ++x) {
++      const int sx = v.srcX(x);
++      if (sx < sourceLo || sx > sourceHi) continue;
++      const size_t byteColumn = static_cast<size_t>(sourceHi - sx) * colBytes;
++      for (int y = 0; y < v.dstHeight; ++y) {
++        const int sy = v.srcY(y);
++        if (sy < 0 || sy >= v.pageHeight) continue;
++        const size_t idx = byteColumn + (sy >> 3);
++        const uint8_t mask = static_cast<uint8_t>(0x80 >> (sy & 7));
++        const bool bit1 = (firstPlane[idx] & mask) != 0;
++        const bool bit2 = (secondPlane[idx] & mask) != 0;
++        const bool draw = pass == 0 ? (bit1 || bit2) : (pass == 1 ? (!bit1 && bit2) : (bit1 != bit2));
++        if (draw) renderer.drawPixel(x, y, state);
++      }
++    }
++  }
++  return true;
++}
++
++bool XtcReaderActivity::renderZoomedPage() {
++  const ZoomViewport v = zoomViewport();
++  renderer.clearScreen();
++  if (!renderZoomPass(v, 0, true)) return false;
++  if (xtc->getBitDepth() == 2) {
++    ReaderUtils::displayGrayBaseWithRefreshCycle(renderer, pagesUntilFullRefresh);
++    renderer.clearScreen(0x00);
++    if (!renderZoomPass(v, 1, false)) return false;
++    renderer.copyGrayscaleLsbBuffers();
++    renderer.clearScreen(0x00);
++    if (!renderZoomPass(v, 2, false)) return false;
++    renderer.copyGrayscaleMsbBuffers();
++    renderer.displayGrayBuffer();
++    // Restore the black/white framebuffer (same as the regular XTC renderer).
++    renderer.clearScreen();
++    if (!renderZoomPass(v, 0, true)) return false;
++    renderer.cleanupGrayscaleWithFrameBuffer();
++  } else {
++    // XTC on 2x input: overlay status bar only if selected in settings.
++    if (SETTINGS.statusBarSpec().xtcMode == CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_TOP)
++      renderStatusBarOverlay(StatusBarOverlayPosition::Top);
++    else renderStatusBarOverlay(StatusBarOverlayPosition::Bottom);
++    ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
++  }
++  return true;
++}
++
+ void XtcReaderActivity::renderPage() {
+   const uint16_t pageWidth = xtc->getPageWidth();
+   const uint16_t pageHeight = xtc->getPageHeight();
+   const uint8_t bitDepth = xtc->getBitDepth();
++
++  // Large files are never loaded as a whole: X3 has no PSRAM. Sample only
++  // bounded strips from SD, even at 100% zoom (which fits the whole page).
++  if (zoomLevelIndex != 0 || pageWidth > renderer.getScreenWidth() ||
++      pageHeight > renderer.getScreenHeight()) {
++    if (renderZoomedPage()) {
++      markPageRendered();
++      return;
++    }
++    renderer.clearScreen();
++    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
++    renderer.displayBuffer();
++    return;
++  }
+ 
+   // XTG (1-bit): Row-major, ((width+7)/8) * height bytes, held whole.
+   // XTH (2-bit): Two column-major bit planes of width * ((height + 7) / 8) bytes each. Only the
+--- a/src/activities/reader/XtcReaderActivity.h
++++ b/src/activities/reader/XtcReaderActivity.h
+@@ -62,6 +62,38 @@
+     std::string title;
+   };
+ 
++  // X3 manual manga zoom: percentage is relative to a fitted full page.
++  static constexpr unsigned long ZOOM_HOLD_MS = 600;
++  static constexpr uint16_t ZOOM_LEVELS[5] = {100, 150, 200, 250, 300};
++  uint8_t zoomLevelIndex = 0;
++  int32_t zoomCenterX = -1;
++  int32_t zoomCenterY = -1;
++  bool suppressZoomRelease[6] = {false, false, false, false, false, false};
++  struct ZoomViewport {
++    int32_t left;
++    int32_t top;
++    int32_t width;
++    int32_t height;
++    int32_t dstWidth;
++    int32_t dstHeight;
++    int32_t pageWidth;
++    int32_t pageHeight;
++    int32_t srcX(int dstX) const {
++      return left + static_cast<int32_t>((static_cast<int64_t>(2 * dstX + 1) * width) / (2 * dstWidth));
++    }
++    int32_t srcY(int dstY) const {
++      return top + static_cast<int32_t>((static_cast<int64_t>(2 * dstY + 1) * height) / (2 * dstHeight));
++    }
++  };
++  ZoomViewport zoomViewport() const;
++  void resetZoomPosition();
++  void clampZoomPosition();
++  bool handleZoomButtons();
++  void zoomBy(int amount);
++  void panBy(int horizontal, int vertical);
++  void changePageBy(int direction);
++  bool renderZoomedPage();
++  bool renderZoomPass(const ZoomViewport& viewport, uint8_t pass, bool state);
+   void renderPage();
+   void renderStatusBarOverlay(StatusBarOverlayPosition position) const;
+   StatusBarInfo getStatusBarInfo() const;
