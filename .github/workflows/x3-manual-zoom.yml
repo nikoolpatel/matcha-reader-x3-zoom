@@ -19,8 +19,10 @@ jobs:
         run: |
           test -f manual_zoom.patch
           test -f xtc_hires.patch
+          test -f xtc_controls_v2.patch
           cp manual_zoom.patch /tmp/manual_zoom.patch
           cp xtc_hires.patch /tmp/xtc_hires.patch
+          cp xtc_controls_v2.patch /tmp/xtc_controls_v2.patch
 
       - name: Check out Matcha Reader 2.0.0
         run: |
@@ -38,6 +40,11 @@ jobs:
         run: |
           git apply --check /tmp/xtc_hires.patch
           git apply /tmp/xtc_hires.patch
+
+      - name: Apply updated X3 button controls and reset-on-page-turn
+        run: |
+          git apply --check /tmp/xtc_controls_v2.patch
+          git apply /tmp/xtc_controls_v2.patch
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
