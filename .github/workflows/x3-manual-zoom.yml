@@ -20,9 +20,11 @@ jobs:
           test -f manual_zoom.patch
           test -f xtc_hires.patch
           test -f xtc_controls_v2.patch
+          test -f xtc_fastnav_v3.patch
           cp manual_zoom.patch /tmp/manual_zoom.patch
           cp xtc_hires.patch /tmp/xtc_hires.patch
           cp xtc_controls_v2.patch /tmp/xtc_controls_v2.patch
+          cp xtc_fastnav_v3.patch /tmp/xtc_fastnav_v3.patch
 
       - name: Check out Matcha Reader 2.0.0
         run: |
@@ -45,6 +47,11 @@ jobs:
         run: |
           git apply --check /tmp/xtc_controls_v2.patch
           git apply /tmp/xtc_controls_v2.patch
+
+      - name: Apply X3 faster navigation and reversed side holds
+        run: |
+          git apply --check /tmp/xtc_fastnav_v3.patch
+          git apply /tmp/xtc_fastnav_v3.patch
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
