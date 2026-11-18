@@ -1,0 +1,86 @@
+name: Build X3 Manual Manga Zoom
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out X3 custom branch
+        uses: actions/checkout@v4
+        with:
+          ref: x3-manual-zoom
+
+      - name: Verify and save both patches
+        run: |
+          test -f manual_zoom.patch
+          test -f xtc_hires.patch
+          test -f xtc_controls_v2.patch
+          test -f xtc_fastnav_v3.patch
+          test -f sleep_photo_frame_v4.patch
+          cp manual_zoom.patch /tmp/manual_zoom.patch
+          cp xtc_hires.patch /tmp/xtc_hires.patch
+          cp xtc_controls_v2.patch /tmp/xtc_controls_v2.patch
+          cp xtc_fastnav_v3.patch /tmp/xtc_fastnav_v3.patch
+          cp sleep_photo_frame_v4.patch /tmp/sleep_photo_frame_v4.patch
+
+      - name: Check out Matcha Reader 2.0.0
+        run: |
+          git fetch https://github.com/eszter007/matcha-reader.git \
+            refs/tags/2.0.0:refs/tags/2.0.0
+          git checkout --detach refs/tags/2.0.0
+          git submodule update --init --recursive
+
+      - name: Apply original Matcha manual zoom patch
+        run: |
+          git apply --check /tmp/manual_zoom.patch
+          git apply /tmp/manual_zoom.patch
+
+      - name: Apply high-resolution XTC and XTCH patch
+        run: |
+          git apply --check /tmp/xtc_hires.patch
+          git apply /tmp/xtc_hires.patch
+
+      - name: Apply updated X3 button controls and reset-on-page-turn
+        run: |
+          git apply --check /tmp/xtc_controls_v2.patch
+          git apply /tmp/xtc_controls_v2.patch
+
+      - name: Apply X3 faster navigation and reversed side holds
+        run: |
+          git apply --check /tmp/xtc_fastnav_v3.patch
+          git apply /tmp/xtc_fastnav_v3.patch
+
+      - name: Apply X3 sleep photo frame v4
+        run: |
+          git apply --check /tmp/sleep_photo_frame_v4.patch
+          git apply /tmp/sleep_photo_frame_v4.patch
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install compatible PIOArduino
+        run: python -m pip install "pioarduino==6.1.19"
+
+      - name: Fix nested PIOArduino environment
+        run: |
+          python -m pip install uv
+          pio pkg install -e default
+          uv pip install --python "$HOME/.platformio/penv/bin/python" "pioarduino==6.1.19"
+          "$HOME/.platformio/penv/bin/pio" --version
+
+      - name: Build X3 firmware
+        run: pio run -e default
+
+      - name: Upload X3 test firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: x3-photo-frame-v4-firmware
+          path: .pio/build/default/firmware.bin
+          if-no-files-found: error
