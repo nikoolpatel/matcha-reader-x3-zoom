@@ -21,10 +21,12 @@ jobs:
           test -f xtc_hires.patch
           test -f xtc_controls_v2.patch
           test -f xtc_fastnav_v3.patch
+          test -f sleep_photo_frame_v4.patch
           cp manual_zoom.patch /tmp/manual_zoom.patch
           cp xtc_hires.patch /tmp/xtc_hires.patch
           cp xtc_controls_v2.patch /tmp/xtc_controls_v2.patch
           cp xtc_fastnav_v3.patch /tmp/xtc_fastnav_v3.patch
+          cp sleep_photo_frame_v4.patch /tmp/sleep_photo_frame_v4.patch
 
       - name: Check out Matcha Reader 2.0.0
         run: |
@@ -53,6 +55,11 @@ jobs:
           git apply --check /tmp/xtc_fastnav_v3.patch
           git apply /tmp/xtc_fastnav_v3.patch
 
+      - name: Apply X3 sleep photo frame v4
+        run: |
+          git apply --check /tmp/sleep_photo_frame_v4.patch
+          git apply /tmp/sleep_photo_frame_v4.patch
+
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -74,6 +81,6 @@ jobs:
       - name: Upload X3 test firmware
         uses: actions/upload-artifact@v4
         with:
-          name: x3-hires-xtc-firmware
+          name: x3-photo-frame-v4-firmware
           path: .pio/build/default/firmware.bin
           if-no-files-found: error
