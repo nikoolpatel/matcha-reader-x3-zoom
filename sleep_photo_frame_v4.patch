@@ -1,0 +1,198 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -24,6 +24,7 @@
+ #include <XteinkDetect.h>
+ #include <builtinFonts/all.h>
+ #include <esp_heap_caps.h>
++#include <esp_sleep.h>
+ #include <esp_sntp.h>
+ #include <esp_wifi.h>
+ #include <time.h>
+@@ -567,9 +568,10 @@
+   deliverSleepPluginEvents(bluetoothStopped);
+ 
+   const bool isQuickResumeSleep =
+-      SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
+-      (fromTimeout &&
+-       SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_AFTER_TIMEOUT);
++      !(SETTINGS.photoFrameMode && gpio.deviceIsX3()) &&
++      (SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
++       (fromTimeout &&
++        SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_AFTER_TIMEOUT));
+   // Every sleep mode leaves a complete retained frame on the e-ink panel. Keep
+   // it visible until the first useful reader or home paint replaces it.
+   APP_STATE.showBootScreen = false;
+@@ -581,6 +583,10 @@
+   halClock.persistSystemTime();
+ 
+   activityManager.goToSleep(fromTimeout);
++  // The sleep-image LCG is advanced during SleepActivity::onEnter(), AFTER
++  // the normal state save above. Persist again to avoid the same photo after
++  // every timer wake and to preserve the non-repeating shuffle cycle.
++  if (SETTINGS.photoFrameMode && gpio.deviceIsX3()) APP_STATE.saveToFile();
+ 
+   if (isQuickResumeSleep) {
+     saveSleepFrameBuffer();
+@@ -610,7 +616,23 @@
+   Storage.prepareForDeepSleep();
+   LOG_DBG("MAIN", "Entering deep sleep");
+ 
+-  powerManager.startDeepSleep(gpio, wakeOnHeldButton);
++  uint32_t photoFrameSeconds = 0;
++  if (gpio.deviceIsX3() && SETTINGS.photoFrameMode &&
++      (Storage.exists("/sleep") || Storage.exists("/.sleep"))) {
++    // No timer when the SD album isn't present, to avoid a repeated boot loop.
++    static constexpr uint32_t INTERVALS[] = {180, 300, 600, 1800, 3600};
++    const uint8_t interval = SETTINGS.photoFrameInterval < 5 ? SETTINGS.photoFrameInterval : 2;
++    photoFrameSeconds = INTERVALS[interval];
++    // Conservative: if battery is known to be very low, stop rotating. A
++    // button wake still works and leaves the last image visible.
++    const auto battery = powerManager.getBatteryPercentage();
++    if (!gpio.isUsbConnected() && battery > 0 && battery < 15) photoFrameSeconds = 0;
++  }
++  halTiltSensor.deepSleep();
++  display.deepSleep();
++  Storage.prepareForDeepSleep();
++  LOG_DBG("MAIN", "Entering deep sleep");
++  powerManager.startDeepSleep(gpio, wakeOnHeldButton, photoFrameSeconds);
+ }
+ 
+ void setupDisplayAndFonts(bool seamless = false) {
+@@ -883,7 +905,19 @@
+   bool allowFastInitialReaderRefresh = false;
+   bool needsWakeRefresh = false;
+ 
+-  setupDisplayAndFonts(resume != BootResume::Splash);
++  // An unattended ESP32 timer wake isn't a user wake. Repaint one sleep image
++  // and return directly to deep sleep, skipping the normal Home/Reader route.
++  // Power-button wakes continue through setup normally, so the user can turn
++  // photo mode off from Settings at any time.
++  const bool photoFrameTimerWake = gpio.deviceIsX3() && SETTINGS.photoFrameMode &&
++      esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER &&
++      (Storage.exists("/sleep") || Storage.exists("/.sleep"));
++  setupDisplayAndFonts(resume != BootResume::Splash || photoFrameTimerWake);
++  if (photoFrameTimerWake && !rebootedFromPanic && !recoveryFirmwareMode) {
++    LOG_INF("FRAME", "Timer wake: displaying next sleep image");
++    enterDeepSleep();  // never returns
++    return;
++  }
+ 
+   switch (resume) {
+     case BootResume::Silent:
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -312,6 +312,10 @@
+ 
+   // Sleep screen settings
+   uint8_t sleepScreen = DARK;
++  // X3: rotate images in /sleep at timed deep-sleep wakeups (defaults off).
++  uint8_t photoFrameMode = 0;
++  // 0=3m, 1=5m, 2=10m, 3=30m, 4=60m.
++  uint8_t photoFrameInterval = 2;
+   // Night mode: inverted output polarity, applied to every activity per
+   // render by ActivityManager. The sleep screen opts out itself.
+   uint8_t screenInverted = 0;
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -380,6 +380,12 @@
+           // they appear there.
+           SettingInfo::Enum(StrId::STR_SLEEP_SCREEN, &CrossPointSettings::sleepScreen, std::move(sleepScreenValues),
+                             "sleepScreen", StrId::STR_CAT_SLEEP),
++          SettingInfo::Toggle(StrId::STR_PHOTO_FRAME_MODE, &CrossPointSettings::photoFrameMode,
++                              "photoFrameMode", StrId::STR_CAT_SLEEP),
++          SettingInfo::Enum(StrId::STR_PHOTO_FRAME_INTERVAL, &CrossPointSettings::photoFrameInterval,
++                            {StrId::STR_PHOTO_EVERY_3, StrId::STR_PHOTO_EVERY_5, StrId::STR_PHOTO_EVERY_10,
++                             StrId::STR_PHOTO_EVERY_30, StrId::STR_PHOTO_EVERY_60},
++                            "photoFrameInterval", StrId::STR_CAT_SLEEP),
+           SettingInfo::Enum(StrId::STR_SLEEP_COVER_MODE, &CrossPointSettings::sleepScreenCoverMode,
+                             {StrId::STR_FIT, StrId::STR_CROP}, "sleepScreenCoverMode", StrId::STR_CAT_SLEEP),
+           SettingInfo::Enum(StrId::STR_SLEEP_COVER_FILTER, &CrossPointSettings::sleepScreenCoverFilter,
+--- a/src/activities/boot_sleep/SleepActivity.cpp
++++ b/src/activities/boot_sleep/SleepActivity.cpp
+@@ -714,8 +714,9 @@
+   Activity::onEnter();
+ 
+   const bool renderQuickResume =
+-      SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
+-      (fromTimeout &&
++      (!(SETTINGS.photoFrameMode && gpio.deviceIsX3()) &&
++       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME) ||
++      (!(SETTINGS.photoFrameMode && gpio.deviceIsX3()) && fromTimeout &&
+        SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_AFTER_TIMEOUT);
+ 
+   if (renderQuickResume) {
+@@ -762,6 +763,10 @@
+   } else {
+     GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
+   }
++
++  // Photo Frame mode always uses the regular sleep picture pool; do not
++  // require changing the user's saved sleep-screen selection permanently.
++  if (SETTINGS.photoFrameMode && gpio.deviceIsX3()) return renderCustomSleepScreen();
+ 
+   switch (SETTINGS.sleepScreen) {
+     case (CrossPointSettings::SLEEP_SCREEN_MODE::BLANK):
+@@ -832,7 +837,7 @@
+ 
+ void SleepActivity::renderCustomSleepScreen() const {
+   // /sleep.bmp on the SD root takes priority over both custom sleep directories.
+-  if (renderCustomSleepBmp("/sleep.bmp")) return;
++  if (!(SETTINGS.photoFrameMode && gpio.deviceIsX3()) && renderCustomSleepBmp("/sleep.bmp")) return;
+ 
+   std::string selectedPath;
+   selectRandomSleepFile(SLEEP_DIRS, std::size(SLEEP_DIRS), SleepRecentKind::Standard, selectedPath);
+--- a/lib/hal/HalPowerManager.h
++++ b/lib/hal/HalPowerManager.h
+@@ -56,7 +56,9 @@
+   // wakeOnHeldButton: arm the wake without waiting for the power button's
+   // release, so a press that is still down wakes the device straight back up
+   // through the normal power-button wake path.
+-  void startDeepSleep(HalGPIO& gpio, bool wakeOnHeldButton = false) const;
++  // autoWakeSeconds: additional timer wake alongside the normal power button.
++  // Use only for X3 photo frame mode; normal sleeping keeps it at zero.
++  void startDeepSleep(HalGPIO& gpio, bool wakeOnHeldButton = false, uint32_t autoWakeSeconds = 0) const;
+ 
+ #if FREEINK_DEVICE_PICCO
+   // While USB powers the device, light-sleep instead of deep sleep (deep sleep
+--- a/lib/hal/HalPowerManager.cpp
++++ b/lib/hal/HalPowerManager.cpp
+@@ -80,7 +80,8 @@
+   xSemaphoreGive(freqMutex);
+ }
+ 
+-void HalPowerManager::startDeepSleep(HalGPIO& gpio, const bool wakeOnHeldButton) const {
++void HalPowerManager::startDeepSleep(HalGPIO& gpio, const bool wakeOnHeldButton,
++                                      const uint32_t autoWakeSeconds) const {
+ #if FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_PICCO
+   // The frontlight driver and touch share I2C; turn the light off before touch
+   // releases the bus. On Picco this also puts the TMA525C to sleep.
+@@ -155,6 +156,13 @@
+   freeink::metalio::powerOff();
+ #endif
+ 
++  // On the X3 GPIO13 gates SD-card power (NOT the battery latch), allowing
++  // the ESP32-C3 RTC timer to wake the device after the SD rail is parked.
++  // Deliberately never enable this for X4: GPIO13 cuts its battery power.
++  if (gpio.deviceIsX3() && autoWakeSeconds > 0) {
++    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(autoWakeSeconds) * 1000000ULL);
++  }
++
+   if (wakeOnHeldButton) {
+     freeink::PowerManager::armPowerButtonWakeup();
+     freeink::PowerManager::deepSleep();
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -6,6 +6,13 @@
+ STR_CROSSPOINT: "Matcha"
+ STR_BOOTING: "BOOTING"
+ STR_SLEEPING: "SLEEPING"
++STR_PHOTO_FRAME_MODE: "Rotate sleep photos"
++STR_PHOTO_FRAME_INTERVAL: "Change photo every"
++STR_PHOTO_EVERY_3: "3 minutes"
++STR_PHOTO_EVERY_5: "5 minutes"
++STR_PHOTO_EVERY_10: "10 minutes"
++STR_PHOTO_EVERY_30: "30 minutes"
++STR_PHOTO_EVERY_60: "1 hour"
+ STR_ENTERING_SLEEP: "Going to sleep"
+ STR_BROWSE_FILES: "Browse Files"
+ STR_FILE_TRANSFER: "File Transfer"
